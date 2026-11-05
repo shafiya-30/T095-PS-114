@@ -1,0 +1,6 @@
+course_id,course_name,duration_months,tuition_fee,material_fee,exam_series_fee,gst_pct
+JEE-2Y,JEE Main + Advanced 2-year,24,240000.00,12000.00,8000.00,18.00
+JEE-1Y,JEE Main 1-year crash,12,140000.00,12000.00,8000.00,18.00
+NEET-1Y,NEET UG 1-year,12,150000.00,12000.00,8000.00,18.00
+NEET-2Y,NEET UG 2-year,24,260000.00,12000.00,8000.00,18.00
+FOUND-1Y,Foundation (Class 9-10),12,90000.00,12000.00,8000.00,18.00
