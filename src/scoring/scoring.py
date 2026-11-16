@@ -84,3 +84,12 @@ def better_waiver(*waivers):
 
 def waiver_valid(result_date, enrol_date):
     return (enrol_date - result_date).days <= ENROL_WINDOW_DAYS
+
+
+def effective_waiver(attempts, enrol_date):
+    valid = [
+        waiver
+        for waiver, result_date in attempts
+        if 0 <= (enrol_date - result_date).days <= ENROL_WINDOW_DAYS
+    ]
+    return better_waiver(*valid) if valid else 0
