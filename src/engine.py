@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src.allocation.allocation import choose_batch, seat_student
 from src.allocation.batches import load_batches
+from src.allocation.viability import check_viability
 from src.allocation.waitlist import WaitEntry, Waitlist
 from src.enrolments import Enrolment
 from src.reports.writers import write_csv
@@ -23,6 +24,8 @@ SCORE_COLUMNS = (
     "waiver_pct",
 )
 
+ALLOCATION_COLUMNS = ("batch_id", "enrol_id", "student_id", "waiver_pct", "status")
+
 
 class Engine:
     def __init__(self, data_dir):
@@ -37,6 +40,7 @@ class Engine:
         }
         self.result_dates = {}
         self.score_rows = []
+        self.allocation_rows = []
         self.enrolments = {}
         self.waitlist = Waitlist()
 
@@ -81,6 +85,33 @@ class Engine:
             enrolment.batch_id = batch.batch_id
         self.enrolments[enrol_id] = enrolment
 
+    def viability_check(self, batch_id, check_date):
+        result = check_viability(self.batches, batch_id)
+        if result is None:
+            return
+        target, moved = result
+        notice = date.fromisoformat(check_date)
+        for enrol_id in moved:
+            enrolment = self.enrolments[enrol_id]
+            enrolment.status = "MERGED"
+            enrolment.merged_from = batch_id
+            enrolment.merge_notice = notice
+            enrolment.batch_id = target.batch_id
+
+    def print_allocation(self, batch_id):
+        for e in self.enrolments.values():
+            in_batch = e.batch_id == batch_id and e.merged_from is None
+            if in_batch or e.merged_from == batch_id:
+                self.allocation_rows.append(
+                    {
+                        "batch_id": batch_id,
+                        "enrol_id": e.enrol_id,
+                        "student_id": e.student_id,
+                        "waiver_pct": e.waiver_pct,
+                        "status": e.status,
+                    }
+                )
+
     def execute(self, command):
         if command.name == "PUBLISH_RESULT":
             self.publish_result(*command.args)
@@ -88,6 +119,10 @@ class Engine:
             self.print_scores(*command.args)
         elif command.name == "ENROL":
             self.enrol(*command.args)
+        elif command.name == "VIABILITY_CHECK":
+            self.viability_check(*command.args)
+        elif command.name == "PRINT_ALLOCATION":
+            self.print_allocation(*command.args)
 
     def run(self, commands):
         for command in commands:
@@ -95,3 +130,4 @@ class Engine:
 
     def write_outputs(self, out_dir):
         write_csv(Path(out_dir) / "scores.csv", SCORE_COLUMNS, self.score_rows)
+        write_csv(Path(out_dir) / "allocations.csv", ALLOCATION_COLUMNS, self.allocation_rows)

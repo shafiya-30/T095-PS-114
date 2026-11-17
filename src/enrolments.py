@@ -16,3 +16,5 @@ class Enrolment:
     has_sibling: bool
     batch_id: str | None = None
     status: str = "ALLOCATED"
+    merged_from: str | None = None
+    merge_notice: date | None = None
