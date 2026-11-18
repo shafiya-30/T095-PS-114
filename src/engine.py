@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,13 +10,16 @@ from src.allocation.waitlist import WaitEntry, Waitlist
 from src.billing.fees import compute_fee, load_courses
 from src.billing.ledger import Ledger
 from src.billing.referral import referral_credit
-from src.billing.refunds import gst_refund, material_refund, refund_percent, tuition_refund, money
 from src.billing.schedule import build_schedule
 from src.enrolments import Enrolment
+from src.refunds.refunds import compute_refund, merge_refund_eligible
 from src.reports.writers import write_csv
 from src.scoring.loader import load_answer_keys, load_responses
 from src.scoring.scoring import effective_waiver, score_cohort
 from src.students import load_students
+
+ZERO = Decimal("0.00")
+FORFEITURE_DAYS = 365
 
 SCORE_COLUMNS = (
     "test_id",
@@ -32,15 +35,6 @@ SCORE_COLUMNS = (
 
 ALLOCATION_COLUMNS = ("batch_id", "enrol_id", "student_id", "waiver_pct", "status")
 
-REFUND_COLUMNS = (
-    "enrol_id",
-    "request_date",
-    "refund_pct",
-    "tuition_refund",
-    "material_refund",
-    "gst_refund",
-    "total_refund",
-)
 STATEMENT_COLUMNS = (
     "enrol_id",
     "as_of_date",
@@ -57,6 +51,29 @@ STATEMENT_COLUMNS = (
     "late_fee",
     "balance",
     "access_status",
+)
+
+REFUND_COLUMNS = (
+    "enrol_id",
+    "request_date",
+    "days_from_start",
+    "refund_pct",
+    "tuition_refund",
+    "material_refund",
+    "gst_refund",
+    "total_refund",
+    "waiver_forfeited",
+)
+
+WAITLIST_COLUMNS = (
+    "as_of_date",
+    "enrol_id",
+    "student_id",
+    "course_id",
+    "centre_id",
+    "medium",
+    "timing",
+    "position",
 )
 
 
@@ -76,10 +93,13 @@ class Engine:
         self.score_rows = []
         self.allocation_rows = []
         self.statement_rows = []
+        self.refund_orders = []
         self.refund_rows = []
+        self.waitlist_rows = []
         self.enrolments = {}
         self.ledgers = {}
         self.referral_credits = {}
+        self.waiver_forfeitures = {}
         self.waitlist = Waitlist()
 
     def publish_result(self, test_id, result_date):
@@ -91,6 +111,9 @@ class Engine:
         self.score_rows.extend(asdict(s) for s in ordered)
 
     def waiver_on(self, student_id, enrol_date):
+        forfeited_on = self.waiver_forfeitures.get(student_id)
+        if forfeited_on and 0 <= (enrol_date - forfeited_on).days <= FORFEITURE_DAYS:
+            return 0
         sat = [t for t, table in self.all_scores.items() if student_id in table]
         published = [self.result_dates[t] for t in sat if t in self.result_dates]
         if not published:
@@ -132,6 +155,7 @@ class Engine:
         else:
             seat_student(batch, enrol_id)
             enrolment.batch_id = batch.batch_id
+            enrolment.original_batch_id = batch.batch_id
             self.open_ledger(enrolment)
         self.enrolments[enrol_id] = enrolment
 
@@ -171,7 +195,7 @@ class Engine:
         credit = referral_credit(before, ledger.settled_count())
         referrer = self.students[self.enrolments[enrol_id].student_id].referred_by
         if credit and referrer:
-            self.referral_credits[referrer] = self.referral_credits.get(referrer, Decimal("0.00")) + credit
+            self.referral_credits[referrer] = self.referral_credits.get(referrer, ZERO) + credit
 
     def print_fee_statement(self, enrol_id, as_of_date):
         ledger = self.ledgers.get(enrol_id)
@@ -192,7 +216,7 @@ class Engine:
                     "material": i.material,
                     "exam_series": i.exam_series,
                     "processing_fee": i.processing_fee,
-                    "other_charges": Decimal("0.00"),
+                    "other_charges": ZERO,
                     "gst": i.gst,
                     "amount": i.amount,
                     "paid": item.paid,
@@ -201,41 +225,61 @@ class Engine:
                     "access_status": access,
                 }
             )
-    def _batch_start(self, batch_id):
-        batches = self.batches.values() if isinstance(self.batches, dict) else self.batches
-        for b in batches:
-            if b.batch_id == batch_id:
-                return b.start_date
-        return None
 
     def dropout(self, enrol_id, request_date, unopened):
         enrolment = self.enrolments.get(enrol_id)
         ledger = self.ledgers.get(enrol_id)
-        if enrolment is None or ledger is None:
+        if enrolment is None or ledger is None or enrolment.status == "DROPPED":
             return
         request = date.fromisoformat(request_date)
-        start = self._batch_start(enrolment.batch_id)
-        if start is None:
-            return
-        is_unopened = unopened.strip().lower() == "true"
+        origin = self.batches[enrolment.original_batch_id]
         settled = [i for i in ledger.items if i.settled_on is not None]
-        tuition_paid = sum((i.instalment.tuition for i in settled), Decimal("0.00"))
-        material_paid = sum((i.instalment.material for i in settled), Decimal("0.00"))
-        tuition = tuition_refund(tuition_paid, start, request)
-        material = material_refund(material_paid, is_unopened, start, request)
-        gst = gst_refund(tuition + material)
-        self.refund_rows.append(
-            {
-                "enrol_id": enrol_id,
-                "request_date": request,
-                "refund_pct": refund_percent(start, request),
-                "tuition_refund": tuition,
-                "material_refund": material,
-                "gst_refund": gst,
-                "total_refund": money(tuition + material + gst),
-            }
+        merged_full = enrolment.merge_notice is not None and merge_refund_eligible(
+            enrolment.merge_notice, request
         )
+        order = compute_refund(
+            enrol_id,
+            request,
+            origin.start_date,
+            sum((i.instalment.tuition for i in settled), ZERO),
+            sum((i.instalment.material for i in settled), ZERO),
+            self.courses[enrolment.course_id].gst_pct,
+            (unopened or "").strip().lower() == "true",
+            origin.is_star,
+            merged_full,
+        )
+        self.refund_orders.append(order)
+        if order.waiver_forfeited:
+            self.waiver_forfeitures[enrolment.student_id] = request
+        current = self.batches[enrolment.batch_id]
+        current.confirmed -= 1
+        current.students.remove(enrol_id)
         enrolment.status = "DROPPED"
+
+    def print_refund_orders(self, from_date, to_date):
+        start = date.fromisoformat(from_date)
+        end = date.fromisoformat(to_date)
+        chosen = sorted(
+            (o for o in self.refund_orders if start <= o.request_date <= end),
+            key=lambda o: o.request_date,
+        )
+        self.refund_rows.extend(asdict(o) for o in chosen)
+
+    def print_waitlist(self, as_of_date):
+        as_of = date.fromisoformat(as_of_date)
+        for entry in self.waitlist.entries:
+            self.waitlist_rows.append(
+                {
+                    "as_of_date": as_of,
+                    "enrol_id": entry.enrol_id,
+                    "student_id": entry.student_id,
+                    "course_id": entry.course_id,
+                    "centre_id": entry.centre_id,
+                    "medium": entry.medium,
+                    "timing": entry.timing,
+                    "position": self.waitlist.position(entry.enrol_id),
+                }
+            )
 
     def execute(self, command):
         if command.name == "PUBLISH_RESULT":
@@ -254,13 +298,19 @@ class Engine:
             self.print_fee_statement(*command.args)
         elif command.name == "DROPOUT":
             self.dropout(*command.args)
+        elif command.name == "PRINT_REFUND_ORDERS":
+            self.print_refund_orders(*command.args)
+        elif command.name == "PRINT_WAITLIST":
+            self.print_waitlist(*command.args)
 
     def run(self, commands):
         for command in commands:
             self.execute(command)
 
     def write_outputs(self, out_dir):
-        write_csv(Path(out_dir) / "scores.csv", SCORE_COLUMNS, self.score_rows)
-        write_csv(Path(out_dir) / "allocations.csv", ALLOCATION_COLUMNS, self.allocation_rows)
-        write_csv(Path(out_dir) / "fee_statements.csv", STATEMENT_COLUMNS, self.statement_rows)
-        write_csv(Path(out_dir) / "refund_orders.csv", REFUND_COLUMNS, self.refund_rows)
+        out = Path(out_dir)
+        write_csv(out / "scores.csv", SCORE_COLUMNS, self.score_rows)
+        write_csv(out / "allocations.csv", ALLOCATION_COLUMNS, self.allocation_rows)
+        write_csv(out / "fee_statements.csv", STATEMENT_COLUMNS, self.statement_rows)
+        write_csv(out / "refund_orders.csv", REFUND_COLUMNS, self.refund_rows)
+        write_csv(out / "waitlist.csv", WAITLIST_COLUMNS, self.waitlist_rows)
