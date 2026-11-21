@@ -1,5 +1,5 @@
 from dataclasses import asdict
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -7,6 +7,7 @@ from src.allocation.allocation import choose_batch, seat_student
 from src.allocation.batches import load_batches
 from src.allocation.viability import check_viability
 from src.allocation.waitlist import WaitEntry, Waitlist
+from src.billing.changes import evaluate_course_change, evaluate_transfer
 from src.billing.fees import compute_fee, load_courses
 from src.billing.ledger import Ledger
 from src.billing.referral import referral_credit
@@ -100,6 +101,7 @@ class Engine:
         self.ledgers = {}
         self.referral_credits = {}
         self.waiver_forfeitures = {}
+        self.rejections = []
         self.waitlist = Waitlist()
 
     def publish_result(self, test_id, result_date):
@@ -281,6 +283,65 @@ class Engine:
                 }
             )
 
+    def move_seat(self, enrolment, target):
+        current = self.batches[enrolment.batch_id]
+        current.confirmed -= 1
+        current.students.remove(enrolment.enrol_id)
+        seat_student(target, enrolment.enrol_id)
+        enrolment.batch_id = target.batch_id
+        enrolment.centre_id = target.centre_id
+        enrolment.medium = target.medium
+        enrolment.timing = target.timing
+
+    def active(self, enrol_id):
+        enrolment = self.enrolments.get(enrol_id)
+        if enrolment is None or enrol_id not in self.ledgers or enrolment.status == "DROPPED":
+            return None
+        return enrolment
+
+    def reject(self, command_name, enrol_id, reason):
+        self.rejections.append({"command": command_name, "enrol_id": enrol_id, "reason": reason})
+
+    def transfer(self, enrol_id, transfer_date, to_batch_id):
+        enrolment = self.active(enrol_id)
+        if enrolment is None:
+            return
+        source = self.batches[enrolment.batch_id]
+        target = self.batches[to_batch_id]
+        change = evaluate_transfer(source, target, enrolment.free_transfers_used)
+        if not change.allowed:
+            self.reject("TRANSFER", enrol_id, change.reason)
+            return
+        self.move_seat(enrolment, target)
+        enrolment.status = "TRANSFERRED"
+        if change.reason == "FREE_TRANSFER":
+            enrolment.free_transfers_used += 1
+        enrolment.extra_charges.append((date.fromisoformat(transfer_date), change.reason, change.amount))
+
+    def upgrade(self, enrol_id, change_date, new_course_id, new_batch_id):
+        enrolment = self.active(enrol_id)
+        if enrolment is None:
+            return
+        current = self.batches[enrolment.batch_id]
+        target = self.batches[new_batch_id]
+        when = date.fromisoformat(change_date)
+        change = evaluate_course_change(
+            self.courses[enrolment.course_id],
+            self.courses[new_course_id],
+            current,
+            target,
+            when,
+            enrolment.waiver_pct,
+            enrolment.has_sibling,
+            enrolment.plan,
+        )
+        if not change.allowed:
+            self.reject("UPGRADE", enrol_id, change.reason)
+            return
+        self.move_seat(enrolment, target)
+        enrolment.course_id = new_course_id
+        enrolment.extra_charges.append((when, change.reason, change.amount))
+
     def execute(self, command):
         if command.name == "PUBLISH_RESULT":
             self.publish_result(*command.args)
@@ -302,6 +363,10 @@ class Engine:
             self.print_refund_orders(*command.args)
         elif command.name == "PRINT_WAITLIST":
             self.print_waitlist(*command.args)
+        elif command.name == "TRANSFER":
+            self.transfer(*command.args)
+        elif command.name == "UPGRADE":
+            self.upgrade(*command.args)
 
     def run(self, commands):
         for command in commands:

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 
@@ -19,3 +19,5 @@ class Enrolment:
     status: str = "ALLOCATED"
     merged_from: str | None = None
     merge_notice: date | None = None
+    free_transfers_used: int = 0
+    extra_charges: list = field(default_factory=list)
