@@ -1,6 +1,6 @@
 from dataclasses import asdict
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from src.allocation.allocation import choose_batch, seat_student
@@ -9,9 +9,11 @@ from src.allocation.viability import check_viability
 from src.allocation.waitlist import WaitEntry, Waitlist
 from src.billing.changes import evaluate_course_change, evaluate_transfer
 from src.billing.fees import compute_fee, load_courses
+from src.billing.late import can_choose_plan_4
 from src.billing.ledger import Ledger
 from src.billing.referral import referral_credit
 from src.billing.schedule import build_schedule
+from src.billing.suspensions import suspension_episodes
 from src.enrolments import Enrolment
 from src.refunds.refunds import compute_refund, merge_refund_eligible
 from src.reports.writers import write_csv
@@ -21,6 +23,22 @@ from src.students import load_students
 
 ZERO = Decimal("0.00")
 FORFEITURE_DAYS = 365
+VALID_PLANS = (1, 2, 4)
+
+ARITY = {
+    "PUBLISH_RESULT": 2,
+    "PRINT_SCORES": 1,
+    "ENROL": 8,
+    "VIABILITY_CHECK": 2,
+    "PRINT_ALLOCATION": 1,
+    "PAYMENT": 5,
+    "PRINT_FEE_STATEMENT": 2,
+    "DROPOUT": 3,
+    "PRINT_REFUND_ORDERS": 2,
+    "PRINT_WAITLIST": 1,
+    "TRANSFER": 3,
+    "UPGRADE": 4,
+}
 
 SCORE_COLUMNS = (
     "test_id",
@@ -78,6 +96,13 @@ WAITLIST_COLUMNS = (
 )
 
 
+class InvalidCommand(Exception):
+    def __init__(self, reason, detail=""):
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
 class Engine:
     def __init__(self, data_dir):
         data = Path(data_dir)
@@ -90,6 +115,9 @@ class Engine:
             test_id: {s.student_id: s for s in score_cohort(test_id, rows, self.keys[test_id])}
             for test_id, rows in self.responses.items()
         }
+        self.centres = {b.centre_id for b in self.batches.values()}
+        self.mediums = {b.medium for b in self.batches.values()}
+        self.timings = {b.timing for b in self.batches.values()}
         self.result_dates = {}
         self.score_rows = []
         self.allocation_rows = []
@@ -99,16 +127,73 @@ class Engine:
         self.waitlist_rows = []
         self.enrolments = {}
         self.ledgers = {}
+        self.payment_ids = set()
         self.referral_credits = {}
         self.waiver_forfeitures = {}
         self.rejections = []
+        self.errors = []
+        self.promotions = []
         self.waitlist = Waitlist()
+        self.handlers = {
+            "PUBLISH_RESULT": self.publish_result,
+            "PRINT_SCORES": self.print_scores,
+            "ENROL": self.enrol,
+            "VIABILITY_CHECK": self.viability_check,
+            "PRINT_ALLOCATION": self.print_allocation,
+            "PAYMENT": self.payment,
+            "PRINT_FEE_STATEMENT": self.print_fee_statement,
+            "DROPOUT": self.dropout,
+            "PRINT_REFUND_ORDERS": self.print_refund_orders,
+            "PRINT_WAITLIST": self.print_waitlist,
+            "TRANSFER": self.transfer,
+            "UPGRADE": self.upgrade,
+        }
+
+    def parse_date(self, text):
+        try:
+            return date.fromisoformat(text)
+        except (TypeError, ValueError):
+            raise InvalidCommand("INVALID_DATE", str(text))
+
+    def parse_amount(self, text):
+        try:
+            value = Decimal(text)
+        except (InvalidOperation, TypeError):
+            raise InvalidCommand("INVALID_AMOUNT", str(text))
+        if not value.is_finite() or value <= 0:
+            raise InvalidCommand("INVALID_AMOUNT", str(text))
+        return value
+
+    def parse_plan(self, text):
+        try:
+            plan = int(text)
+        except (TypeError, ValueError):
+            raise InvalidCommand("INVALID_PLAN", str(text))
+        if plan not in VALID_PLANS:
+            raise InvalidCommand("INVALID_PLAN", str(text))
+        return plan
+
+    def known(self, table, key, reason):
+        if key not in table:
+            raise InvalidCommand(reason, str(key))
+        return table[key]
+
+    def live_enrolment(self, enrol_id):
+        enrolment = self.known(self.enrolments, enrol_id, "UNKNOWN_ENROLMENT")
+        if enrolment.status == "DROPPED":
+            raise InvalidCommand("ALREADY_DROPPED", enrol_id)
+        if enrol_id not in self.ledgers:
+            raise InvalidCommand("NOT_SEATED", enrol_id)
+        return enrolment
 
     def publish_result(self, test_id, result_date):
-        self.result_dates[test_id] = date.fromisoformat(result_date)
+        self.known(self.all_scores, test_id, "UNKNOWN_TEST")
+        self.result_dates[test_id] = self.parse_date(result_date)
 
     def print_scores(self, test_id):
-        table = self.all_scores[test_id]
+        table = self.known(self.all_scores, test_id, "UNKNOWN_TEST")
+        if test_id not in self.result_dates:
+            raise InvalidCommand("RESULT_NOT_PUBLISHED", test_id)
         ordered = sorted(table.values(), key=lambda s: (-s.total, s.student_id))
         self.score_rows.extend(asdict(s) for s in ordered)
 
@@ -124,31 +209,53 @@ class Engine:
         attempts = [(self.all_scores[t][student_id].waiver_pct, window_start) for t in sat]
         return effective_waiver(attempts, enrol_date)
 
-    def open_ledger(self, enrolment):
+    def suspension_count(self, student_id, as_of):
+        pairs = [
+            (item.instalment.due_date, item.settled_on)
+            for e in self.enrolments.values()
+            if e.student_id == student_id and e.enrol_id in self.ledgers
+            for item in self.ledgers[e.enrol_id].items
+        ]
+        return suspension_episodes(pairs, as_of)
+
+    def open_ledger(self, enrolment, start):
         fee = compute_fee(
             self.courses[enrolment.course_id],
             enrolment.waiver_pct,
             enrolment.has_sibling,
             enrolment.plan,
         )
-        ledger = Ledger(build_schedule(fee, enrolment.plan, enrolment.enrol_date))
-        ledger.pay(ledger.items[0].instalment.amount, enrolment.enrol_date)
+        ledger = Ledger(build_schedule(fee, enrolment.plan, start))
+        ledger.pay(ledger.items[0].instalment.amount, start)
         self.ledgers[enrolment.enrol_id] = ledger
 
     def enrol(self, enrol_id, student_id, enrol_date, course_id, centre_id, medium, timing, plan):
-        enrol_date = date.fromisoformat(enrol_date)
-        waiver = self.waiver_on(student_id, enrol_date)
+        when = self.parse_date(enrol_date)
+        if enrol_id in self.enrolments:
+            raise InvalidCommand("DUPLICATE_ENROLMENT", enrol_id)
+        student = self.known(self.students, student_id, "UNKNOWN_STUDENT")
+        self.known(self.courses, course_id, "UNKNOWN_COURSE")
+        if centre_id not in self.centres:
+            raise InvalidCommand("UNKNOWN_CENTRE", str(centre_id))
+        if medium not in self.mediums:
+            raise InvalidCommand("INVALID_MEDIUM", str(medium))
+        if timing not in self.timings:
+            raise InvalidCommand("INVALID_TIMING", str(timing))
+        plan_number = self.parse_plan(plan)
+        if plan_number == 4 and not can_choose_plan_4(self.suspension_count(student_id, when)):
+            raise InvalidCommand("PLAN_4_NOT_AVAILABLE", student_id)
+        waiver = self.waiver_on(student_id, when)
         enrolment = Enrolment(
             enrol_id,
             student_id,
-            enrol_date,
+            when,
             course_id,
             centre_id,
             medium,
             timing,
-            int(plan),
+            plan_number,
             waiver,
-            self.students[student_id].sibling_of is not None,
+            student.sibling_of is not None,
         )
         batch = choose_batch(self.batches, course_id, centre_id, medium, timing, waiver)
         if batch is None:
@@ -158,15 +265,27 @@ class Engine:
             seat_student(batch, enrol_id)
             enrolment.batch_id = batch.batch_id
             enrolment.original_batch_id = batch.batch_id
-            self.open_ledger(enrolment)
+            self.open_ledger(enrolment, when)
         self.enrolments[enrol_id] = enrolment
 
+    def fill_seat(self, batch, when):
+        entry = self.waitlist.promote_into(batch)
+        if entry is None:
+            return
+        enrolment = self.enrolments[entry.enrol_id]
+        enrolment.status = "ALLOCATED"
+        enrolment.batch_id = batch.batch_id
+        enrolment.original_batch_id = batch.batch_id
+        self.open_ledger(enrolment, when)
+        self.promotions.append({"enrol_id": entry.enrol_id, "batch_id": batch.batch_id, "date": when})
+
     def viability_check(self, batch_id, check_date):
+        self.known(self.batches, batch_id, "UNKNOWN_BATCH")
+        notice = self.parse_date(check_date)
         result = check_viability(self.batches, batch_id)
         if result is None:
             return
         target, moved = result
-        notice = date.fromisoformat(check_date)
         for enrol_id in moved:
             enrolment = self.enrolments[enrol_id]
             enrolment.status = "MERGED"
@@ -175,6 +294,7 @@ class Engine:
             enrolment.batch_id = target.batch_id
 
     def print_allocation(self, batch_id):
+        self.known(self.batches, batch_id, "UNKNOWN_BATCH")
         for e in self.enrolments.values():
             in_batch = e.batch_id == batch_id and e.merged_from is None
             if in_batch or e.merged_from == batch_id:
@@ -189,21 +309,26 @@ class Engine:
                 )
 
     def payment(self, payment_id, enrol_id, payment_date, amount, mode):
-        ledger = self.ledgers.get(enrol_id)
-        if ledger is None:
-            return
+        paid_on = self.parse_date(payment_date)
+        enrolment = self.live_enrolment(enrol_id)
+        value = self.parse_amount(amount)
+        if payment_id in self.payment_ids:
+            raise InvalidCommand("DUPLICATE_PAYMENT", payment_id)
+        self.payment_ids.add(payment_id)
+        ledger = self.ledgers[enrol_id]
         before = ledger.settled_count()
-        ledger.pay(Decimal(amount), date.fromisoformat(payment_date))
+        ledger.pay(value, paid_on)
         credit = referral_credit(before, ledger.settled_count())
-        referrer = self.students[self.enrolments[enrol_id].student_id].referred_by
+        referrer = self.students[enrolment.student_id].referred_by
         if credit and referrer:
             self.referral_credits[referrer] = self.referral_credits.get(referrer, ZERO) + credit
 
     def print_fee_statement(self, enrol_id, as_of_date):
+        as_of = self.parse_date(as_of_date)
+        self.known(self.enrolments, enrol_id, "UNKNOWN_ENROLMENT")
         ledger = self.ledgers.get(enrol_id)
         if ledger is None:
             return
-        as_of = date.fromisoformat(as_of_date)
         access = ledger.access_status(as_of)
         for item in ledger.items:
             i = item.instalment
@@ -229,11 +354,15 @@ class Engine:
             )
 
     def dropout(self, enrol_id, request_date, unopened):
-        enrolment = self.enrolments.get(enrol_id)
-        ledger = self.ledgers.get(enrol_id)
-        if enrolment is None or ledger is None or enrolment.status == "DROPPED":
+        request = self.parse_date(request_date)
+        enrolment = self.known(self.enrolments, enrol_id, "UNKNOWN_ENROLMENT")
+        if enrolment.status == "DROPPED":
+            raise InvalidCommand("ALREADY_DROPPED", enrol_id)
+        if enrolment.status == "WAITLISTED":
+            self.waitlist.remove(enrol_id)
+            enrolment.status = "DROPPED"
             return
-        request = date.fromisoformat(request_date)
+        ledger = self.ledgers[enrol_id]
         origin = self.batches[enrolment.original_batch_id]
         settled = [i for i in ledger.items if i.settled_on is not None]
         merged_full = enrolment.merge_notice is not None and merge_refund_eligible(
@@ -257,10 +386,13 @@ class Engine:
         current.confirmed -= 1
         current.students.remove(enrol_id)
         enrolment.status = "DROPPED"
+        self.fill_seat(current, request)
 
     def print_refund_orders(self, from_date, to_date):
-        start = date.fromisoformat(from_date)
-        end = date.fromisoformat(to_date)
+        start = self.parse_date(from_date)
+        end = self.parse_date(to_date)
+        if start > end:
+            raise InvalidCommand("INVALID_DATE_RANGE", f"{from_date} to {to_date}")
         chosen = sorted(
             (o for o in self.refund_orders if start <= o.request_date <= end),
             key=lambda o: o.request_date,
@@ -268,7 +400,7 @@ class Engine:
         self.refund_rows.extend(asdict(o) for o in chosen)
 
     def print_waitlist(self, as_of_date):
-        as_of = date.fromisoformat(as_of_date)
+        as_of = self.parse_date(as_of_date)
         for entry in self.waitlist.entries:
             self.waitlist_rows.append(
                 {
@@ -283,7 +415,7 @@ class Engine:
                 }
             )
 
-    def move_seat(self, enrolment, target):
+    def move_seat(self, enrolment, target, when):
         current = self.batches[enrolment.batch_id]
         current.confirmed -= 1
         current.students.remove(enrolment.enrol_id)
@@ -292,42 +424,37 @@ class Engine:
         enrolment.centre_id = target.centre_id
         enrolment.medium = target.medium
         enrolment.timing = target.timing
-
-    def active(self, enrol_id):
-        enrolment = self.enrolments.get(enrol_id)
-        if enrolment is None or enrol_id not in self.ledgers or enrolment.status == "DROPPED":
-            return None
-        return enrolment
+        self.fill_seat(current, when)
 
     def reject(self, command_name, enrol_id, reason):
         self.rejections.append({"command": command_name, "enrol_id": enrol_id, "reason": reason})
 
     def transfer(self, enrol_id, transfer_date, to_batch_id):
-        enrolment = self.active(enrol_id)
-        if enrolment is None:
-            return
+        when = self.parse_date(transfer_date)
+        enrolment = self.live_enrolment(enrol_id)
         source = self.batches[enrolment.batch_id]
-        target = self.batches[to_batch_id]
+        target = self.known(self.batches, to_batch_id, "UNKNOWN_BATCH")
         change = evaluate_transfer(source, target, enrolment.free_transfers_used)
         if not change.allowed:
             self.reject("TRANSFER", enrol_id, change.reason)
             return
-        self.move_seat(enrolment, target)
+        self.move_seat(enrolment, target, when)
         enrolment.status = "TRANSFERRED"
         if change.reason == "FREE_TRANSFER":
             enrolment.free_transfers_used += 1
-        enrolment.extra_charges.append((date.fromisoformat(transfer_date), change.reason, change.amount))
+        enrolment.extra_charges.append((when, change.reason, change.amount))
 
     def upgrade(self, enrol_id, change_date, new_course_id, new_batch_id):
-        enrolment = self.active(enrol_id)
-        if enrolment is None:
-            return
+        when = self.parse_date(change_date)
+        enrolment = self.live_enrolment(enrol_id)
+        new_course = self.known(self.courses, new_course_id, "UNKNOWN_COURSE")
+        target = self.known(self.batches, new_batch_id, "UNKNOWN_BATCH")
+        if target.course_id != new_course_id:
+            raise InvalidCommand("BATCH_COURSE_MISMATCH", f"{new_batch_id} is not {new_course_id}")
         current = self.batches[enrolment.batch_id]
-        target = self.batches[new_batch_id]
-        when = date.fromisoformat(change_date)
         change = evaluate_course_change(
             self.courses[enrolment.course_id],
-            self.courses[new_course_id],
+            new_course,
             current,
             target,
             when,
@@ -338,35 +465,33 @@ class Engine:
         if not change.allowed:
             self.reject("UPGRADE", enrol_id, change.reason)
             return
-        self.move_seat(enrolment, target)
+        self.move_seat(enrolment, target, when)
         enrolment.course_id = new_course_id
         enrolment.extra_charges.append((when, change.reason, change.amount))
 
+    def fail(self, command, reason, detail):
+        self.errors.append(
+            {"line": command.line_no, "command": command.name, "reason": reason, "detail": detail}
+        )
+
     def execute(self, command):
-        if command.name == "PUBLISH_RESULT":
-            self.publish_result(*command.args)
-        elif command.name == "PRINT_SCORES":
-            self.print_scores(*command.args)
-        elif command.name == "ENROL":
-            self.enrol(*command.args)
-        elif command.name == "VIABILITY_CHECK":
-            self.viability_check(*command.args)
-        elif command.name == "PRINT_ALLOCATION":
-            self.print_allocation(*command.args)
-        elif command.name == "PAYMENT":
-            self.payment(*command.args)
-        elif command.name == "PRINT_FEE_STATEMENT":
-            self.print_fee_statement(*command.args)
-        elif command.name == "DROPOUT":
-            self.dropout(*command.args)
-        elif command.name == "PRINT_REFUND_ORDERS":
-            self.print_refund_orders(*command.args)
-        elif command.name == "PRINT_WAITLIST":
-            self.print_waitlist(*command.args)
-        elif command.name == "TRANSFER":
-            self.transfer(*command.args)
-        elif command.name == "UPGRADE":
-            self.upgrade(*command.args)
+        handler = self.handlers.get(command.name)
+        if handler is None:
+            self.fail(command, "UNKNOWN_COMMAND", command.name)
+            return
+        if len(command.args) != ARITY[command.name]:
+            self.fail(
+                command,
+                "WRONG_ARGUMENT_COUNT",
+                f"expected {ARITY[command.name]}, got {len(command.args)}",
+            )
+            return
+        try:
+            handler(*command.args)
+        except InvalidCommand as problem:
+            self.fail(command, problem.reason, problem.detail)
+        except (KeyError, ValueError, TypeError, AttributeError) as problem:
+            self.fail(command, "UNEXPECTED_ERROR", repr(problem))
 
     def run(self, commands):
         for command in commands:

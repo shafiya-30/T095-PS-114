@@ -46,6 +46,16 @@ def summary(engine, commands, out_dir):
         for source, target in merges:
             print(f"  {source} merged into {target}")
 
+    if engine.errors:
+        section("INVALID COMMANDS (skipped)")
+        for e in engine.errors:
+            print(f"  line {e['line']:<4}{e['command']:<20}{e['reason']}  {e['detail']}")
+
+    if engine.promotions:
+        section("WAITLIST PROMOTIONS")
+        for p in engine.promotions:
+            print(f"  {p['enrol_id']} got a seat in {p['batch_id']} on {p['date']}")
+
     if engine.rejections:
         section("REJECTED REQUESTS")
         for r in engine.rejections:
