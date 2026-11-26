@@ -104,4 +104,4 @@ docs/           design document and decision log
 
 ## Demo video
 
-Link: <video controls src="demo.mp4" title="Title"></video>
+Link: https://drive.google.com/file/d/1olf6NyHbwP7uBKyYoC19_U2uTWmX8jMO/view?usp=sharing
