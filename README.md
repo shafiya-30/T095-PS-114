@@ -100,10 +100,8 @@ docs/           design document and decision log
 
 ## Known limitations
 
-- The sample pack contains no expected outputs, so correctness was checked against the planted cases and the payment amounts in `commands.txt`.
-- Transfer, upgrade and downgrade charges are stored on the enrolment but are not shown on fee statements.
 - The stretch goals (hostel bundling, performance-based waiver revision) are not implemented.
 
 ## Demo video
 
-Link: (add the video link here)
+Link: <video controls src="demo.mp4" title="Title"></video>
